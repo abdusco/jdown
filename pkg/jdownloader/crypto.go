@@ -11,32 +11,33 @@ import (
 )
 
 type crypto struct {
-	creds       Credentials
-	loginSecret [32]byte
+	creds Credentials
 }
 
-func newCrypto(creds Credentials) crypto {
-	c := crypto{
-		creds: creds,
-	}
-	c.loginSecret = c.makeSecret("server")
-	return c
+func (c crypto) makeSecret(purpose string) []byte {
+	hash := sha256.Sum256([]byte(strings.ToLower(c.creds.Email) + c.creds.Password + purpose))
+	return hash[:]
 }
 
-func (c crypto) makeSecret(purpose string) [32]byte {
-	return sha256.Sum256([]byte(strings.ToLower(c.creds.Email) + c.creds.Password + purpose))
+func (c crypto) LoginSecret() []byte {
+	return c.makeSecret("server")
+}
+func (c crypto) DeviceSecret() []byte {
+	return c.makeSecret("device")
 }
 
-// sign signs a message using HMAC-SHA256 scheme
-func (c crypto) sign(message string) string {
-	h := hmac.New(sha256.New, c.loginSecret[:])
+func (c crypto) Sign(key []byte, message string) string {
+	h := hmac.New(sha256.New, key)
 	h.Write([]byte(message))
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
-func (c crypto) decrypt(encrypted []byte) ([]byte, error) {
-	aesKey := c.loginSecret[16:] // first half
-	iv := c.loginSecret[:16]     // second half
+func (c crypto) Decrypt(key []byte, encrypted []byte) ([]byte, error) {
+	if len(key) != 32 {
+		return nil, fmt.Errorf("key must be at least 32 bytes")
+	}
+	aesKey := key[16:] // first half
+	iv := key[:16]     // second half
 
 	block, err := aes.NewCipher(aesKey)
 	if err != nil {

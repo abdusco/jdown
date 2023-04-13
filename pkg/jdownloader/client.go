@@ -1,24 +1,18 @@
 package jdownloader
 
 import (
-	"bytes"
-	"encoding/base64"
 	"fmt"
-	"io"
-	"net/http"
+	"net/url"
 	"strings"
-	"sync/atomic"
 
 	"github.com/imroc/req/v3"
 )
 
 type Client struct {
-	http         *req.Client
-	requestID    int64
-	crypto       crypto
-	email        string
-	sessionToken string
-	regainToken  string
+	http    *req.Client
+	crypto  crypto
+	email   string
+	session *session
 }
 
 type Credentials struct {
@@ -27,64 +21,24 @@ type Credentials struct {
 }
 
 func NewClient(credentials Credentials) *Client {
-	c := &Client{
-		http:   req.NewClient().SetBaseURL("https://api.jdownloader.org"),
-		crypto: newCrypto(credentials),
-		email:  credentials.Email,
+	s := newSession(credentials)
+	client := &Client{
+		http: req.NewClient().
+			SetBaseURL("http://api.jdownloader.org").
+			OnBeforeRequest(s.signRequest).
+			OnAfterResponse(s.decodeResponse),
+		email:   credentials.Email,
+		session: &s,
 	}
-	c.http.OnBeforeRequest(c.signRequest)
-	c.http.OnAfterResponse(c.decodeResponse)
-	return c
-}
-
-func (c *Client) signRequest(_ *req.Client, req *req.Request) error {
-	if req.Method != http.MethodPost {
-		return nil
-	}
-	req.SetContentType("application/aesjson-jd; charset=utf-8")
-
-	nextReqID := atomic.AddInt64(&c.requestID, 1)
-	req.AddQueryParam("rid", fmt.Sprintf("%d", nextReqID))
-
-	uri := req.RawURL + "?" + req.QueryParams.Encode()
-	signed := c.crypto.sign(uri)
-	req.AddQueryParam("signature", signed)
-
-	return nil
-}
-
-func (c *Client) decodeResponse(_ *req.Client, res *req.Response) error {
-	encoded, err := res.ToString()
-	if err != nil {
-		return fmt.Errorf("failed to read response body: %w", err)
-	}
-	body, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil {
-		return fmt.Errorf("failed to decode body as base64: %w", err)
-	}
-
-	m, err := c.crypto.decrypt(body)
-	if err != nil {
-		return fmt.Errorf("failed to decrypt body: %w", err)
-	}
-	httpRes := res.Response
-	httpRes.Body = io.NopCloser(bytes.NewReader(m))
-	httpRes.Header.Set("content-type", "application/json; charset=utf-8")
-	*res = req.Response{
-		Response: httpRes,
-		Err:      res.Err,
-		Request:  res.Request,
-	}
-	return nil
+	return client
 }
 
 func (c *Client) Connect() error {
 	res, err := c.http.R().
-		SetQueryParams(map[string]string{
-			"email":  strings.ToLower(c.email),
-			"appkey": "",
-		}).
-		Post("/my/connect")
+		Post(buildURL("/my/connect",
+			"email", strings.ToLower(c.email),
+			"appkey", "jdown",
+		))
 	if err != nil {
 		return fmt.Errorf("failed to send req: %w", err)
 	}
@@ -94,13 +48,71 @@ func (c *Client) Connect() error {
 		SessionToken string `json:"sessiontoken"`
 		RegainToken  string `json:"regaintoken"`
 	}
-	if err := res.Into(&response); err != nil {
+	if err := res.UnmarshalJson(&response); err != nil {
 		return fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	c.sessionToken = response.SessionToken
-	c.regainToken = response.RegainToken
-	// TODO: compare request ids
+	if err := c.session.VerifyRequestID(response.ResponseID); err != nil {
+		return err
+	}
+	c.session.Update(response.SessionToken, response.RegainToken)
+
+	return nil
+}
+
+// buildURL builds a URL with the given path and query parameters.
+// We cannot use url.Values because MyJDownloader API returns an error
+// if the query parameters are not specified in the right order.
+func buildURL(path string, query ...string) string {
+	var out strings.Builder
+
+	out.WriteString(path)
+
+	if !strings.Contains(path, "?") {
+		out.WriteString("?")
+	} else {
+		out.WriteString("&")
+	}
+
+	for i := 0; i < len(query); i += 2 {
+		k := query[i]
+		v := query[i+1]
+
+		out.WriteString(url.QueryEscape(k))
+		out.WriteString("=")
+		out.WriteString(url.QueryEscape(v))
+
+		if i+2 < len(query) {
+			out.WriteString("&")
+		}
+	}
+	return out.String()
+}
+
+func (c *Client) Reconnect() error {
+	res, err := c.http.R().
+		Get(buildURL("/my/reconnect",
+			"sessiontoken", c.session.SessionToken,
+			"regaintoken", c.session.RegainToken,
+		))
+	if err != nil {
+		return fmt.Errorf("failed to send req: %w", err)
+	}
+
+	var response struct {
+		ResponseID   int64  `json:"rid"`
+		SessionToken string `json:"sessiontoken"`
+		RegainToken  string `json:"regaintoken"`
+	}
+	if err := res.UnmarshalJson(&response); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if err := c.session.VerifyRequestID(response.ResponseID); err != nil {
+		return err
+	}
+
+	c.session.Update(response.SessionToken, response.RegainToken)
 
 	return nil
 }
