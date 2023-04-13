@@ -116,3 +116,30 @@ func (c *Client) Reconnect() error {
 
 	return nil
 }
+
+type Device struct {
+	ID     string `json:"id"`
+	Type   string `json:"type"`
+	Name   string `json:"name"`
+	Status string `json:"status"`
+}
+
+func (c *Client) ListDevices() ([]Device, error) {
+	res, err := c.http.R().
+		Get(buildURL("/my/listdevices",
+			"sessiontoken", c.session.SessionToken,
+		))
+	if err != nil {
+		return nil, fmt.Errorf("failed to send req: %w", err)
+	}
+
+	var response struct {
+		ResponseID int64    `json:"rid,omitempty"`
+		Devices    []Device `json:"list"`
+	}
+	if err := res.UnmarshalJson(&response); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	return response.Devices, nil
+}
