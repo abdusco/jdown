@@ -10,7 +10,6 @@ import (
 
 type Client struct {
 	http    *req.Client
-	crypto  crypto
 	email   string
 	session *session
 }
