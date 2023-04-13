@@ -125,3 +125,7 @@ func (s *session) Key() []byte {
 	}
 	return s.ServerEncryptionToken
 }
+
+func (s *session) Clear() *session {
+	return &session{crypto: s.crypto}
+}

@@ -117,11 +117,16 @@ func (c *Client) Reconnect() error {
 	return nil
 }
 
-type Device struct {
-	ID     string `json:"id"`
-	Type   string `json:"type"`
-	Name   string `json:"name"`
-	Status string `json:"status"`
+func (c *Client) Disconnect() error {
+	_, err := c.http.R().
+		Get(buildURL("/my/disconnect",
+			"sessiontoken", c.session.SessionToken,
+		))
+	if err != nil {
+		return fmt.Errorf("failed to send req: %w", err)
+	}
+	c.session = c.session.Clear()
+	return nil
 }
 
 func (c *Client) ListDevices() ([]Device, error) {
