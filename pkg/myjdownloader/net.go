@@ -1,4 +1,4 @@
-package jdownloader
+package myjdownloader
 
 import (
 	"fmt"
