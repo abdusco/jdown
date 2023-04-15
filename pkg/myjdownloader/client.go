@@ -106,11 +106,12 @@ func (c *Client) Reconnect(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) Disconnect() error {
+func (c *Client) Disconnect(ctx context.Context) error {
 	uri := newURL("/my/disconnect").
 		AddQuery("sessiontoken", c.session.SessionToken)
 
 	_, err := c.http.R().
+		SetContext(ctx).
 		Get(uri.String())
 	if err != nil {
 		return fmt.Errorf("request failed: %w", err)
@@ -245,14 +246,16 @@ func (c *DeviceClient) AddLink(ctx context.Context, packageName string, urls ...
 	return nil
 }
 
-func (c *DeviceClient) StartDownload() error {
+func (c *DeviceClient) StartDownload(ctx context.Context) error {
 	_, err := c.http.R().
+		SetContext(ctx).
 		Post("/downloadcontroller/start")
 	return err
 }
 
-func (c *DeviceClient) StopDownload() error {
+func (c *DeviceClient) StopDownload(ctx context.Context) error {
 	_, err := c.http.R().
+		SetContext(ctx).
 		Post("/downloadcontroller/stop")
 	return err
 }
