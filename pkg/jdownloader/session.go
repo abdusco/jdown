@@ -5,73 +5,20 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"sync/atomic"
+	"time"
 
 	"github.com/imroc/req/v3"
 )
 
-func (s *session) signRequest(_ *req.Client, req *req.Request) error {
-	req.RawURL = buildURL(req.RawURL, "rid", s.NextRequestID())
-
-	key := s.Key()
-	signed := s.crypto.Sign(key, req.RawURL)
-	req.RawURL = buildURL(req.RawURL, "signature", url.QueryEscape(signed))
-
-	if req.Method == http.MethodPost {
-		req.SetContentType("application/aesjson-jd; charset=utf-8")
-	}
-
-	return nil
-}
-
-func (s *session) decodeResponse(_ *req.Client, res *req.Response) error {
-	body, err := res.ToString()
-	if err != nil {
-		return fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	if res.IsErrorState() {
-		var response struct {
-			Source string `json:"src"`
-			Type   string `json:"type"`
-		}
-		if err := res.UnmarshalJson(&response); err != nil {
-			return fmt.Errorf("failed to unmarshal error response as json: %w", err)
-		}
-		return fmt.Errorf("received HTTP %d response: error: %s", res.StatusCode, response.Type)
-	}
-
-	decodedBody, err := base64.StdEncoding.DecodeString(body)
-	if err != nil {
-		return fmt.Errorf("failed to decode body as base64: %w", err)
-	}
-
-	key := s.Key()
-	plaintextBody, err := s.crypto.Decrypt(key[:], decodedBody)
-	if err != nil {
-		return fmt.Errorf("failed to decrypt body: %w", err)
-	}
-
-	httpRes := res.Response
-	httpRes.Body = io.NopCloser(bytes.NewReader(plaintextBody))
-	httpRes.Header.Set("content-type", "application/json; charset=utf-8")
-	*res = req.Response{
-		Response: httpRes,
-		Err:      res.Err,
-		Request:  res.Request,
-	}
-
-	return nil
-}
-
 type session struct {
-	connected             bool
+	connectedAt           *time.Time
 	RequestID             int64
 	SessionToken          string
 	RegainToken           string
@@ -85,8 +32,8 @@ func newSession(c Credentials) session {
 	return s
 }
 
-func (s *session) NextRequestID() string {
-	return strconv.FormatInt(atomic.AddInt64(&s.RequestID, 1), 10)
+func (s *session) NextRequestID() int64 {
+	return atomic.AddInt64(&s.RequestID, 1)
 }
 
 var errRequestIDMismatch = errors.New("request id mismatch")
@@ -104,14 +51,15 @@ func (s *session) Update(sessionToken string, regainToken string) {
 
 	token, _ := hex.DecodeString(sessionToken)
 
-	if !s.connected {
+	if s.connectedAt == nil {
 		s.ServerEncryptionToken = s.crypto.LoginSecret()
 		s.DeviceEncryptionToken = s.crypto.DeviceSecret()
 	}
 	s.ServerEncryptionToken = s.sha256(append(s.ServerEncryptionToken, token...))
 	s.DeviceEncryptionToken = s.sha256(append(s.DeviceEncryptionToken, token...))
 
-	s.connected = sessionToken != ""
+	now := time.Now()
+	s.connectedAt = &now
 }
 
 func (s *session) sha256(b []byte) []byte {
@@ -119,13 +67,152 @@ func (s *session) sha256(b []byte) []byte {
 	return hash[:]
 }
 
-func (s *session) Key() []byte {
-	if !s.connected {
-		return s.crypto.LoginSecret()
-	}
-	return s.ServerEncryptionToken
+func (s *session) LoginSecret() []byte {
+	return s.crypto.LoginSecret()
 }
 
 func (s *session) Clear() *session {
 	return &session{crypto: s.crypto}
+}
+
+type wrappedPayload struct {
+	APIVersion uint   `json:"apiVer"`
+	URL        string `json:"url"`
+	Params     []any  `json:"params"`
+	RequestID  int64  `json:"rid"`
+}
+
+func (s *session) serverRoundTrip(rt req.RoundTripper, r *req.Request) (*req.Response, error) {
+	uri := newURL(r.URL.String()).AddQuery("rid", s.NextRequestID())
+	key, ok := r.Context().Value(encryptionKey{}).([]byte)
+	if !ok {
+		key = s.ServerEncryptionToken
+	}
+	signature := s.crypto.Sign(key, []byte(uri.URL().RequestURI()))
+	uri.AddQuery("signature", signature)
+	r.URL = uri.URL()
+
+	if r.Method == http.MethodPost {
+		r.SetContentType("application/aesjson-jd; charset=utf-8")
+	}
+
+	res, err := rt.RoundTrip(r)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+
+	body, err := res.ToString()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	if res.IsErrorState() {
+		var response struct {
+			Source string `json:"src"`
+			Type   string `json:"type"`
+		}
+		if err := res.UnmarshalJson(&response); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal error response as json: %w", err)
+		}
+		return nil, fmt.Errorf("received HTTP %d response: error: %s", res.StatusCode, response.Type)
+	}
+
+	decodedBody, err := base64.StdEncoding.DecodeString(body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode body as base64: %w", err)
+	}
+
+	plaintextBody, err := s.crypto.Decrypt(key[:], decodedBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt body: %w", err)
+	}
+
+	httpRes := res.Response
+	httpRes.Body = io.NopCloser(bytes.NewReader(plaintextBody))
+	httpRes.Header.Set("content-type", "application/json; charset=utf-8")
+	return &req.Response{
+		Response: httpRes,
+		Err:      res.Err,
+		Request:  res.Request,
+	}, nil
+}
+
+func (s *session) deviceRoundTrip(rt req.RoundTripper, r *req.Request, device Device) (*req.Response, error) {
+	action := r.URL.Path
+	payload := wrappedPayload{
+		APIVersion: 1,
+		URL:        action,
+		Params:     []any{string(r.Body)},
+		RequestID:  s.NextRequestID(),
+	}
+
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal body: %w", err)
+	}
+
+	encrypted, err := s.crypto.Encrypt(s.DeviceEncryptionToken, b)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encrypt body: %w", err)
+	}
+
+	r.SetBodyString(base64.StdEncoding.EncodeToString(encrypted))
+	r.SetContentType("application/aesjson-jd; charset=utf-8")
+
+	r.URL.Path = fmt.Sprintf(
+		"/t_%s_%s%s",
+		url.PathEscape(s.SessionToken),
+		url.PathEscape(device.ID),
+		r.URL.Path,
+	)
+
+	res, err := rt.RoundTrip(r)
+	if err != nil {
+		return res, fmt.Errorf("failed to send request: %w", err)
+	}
+
+	body, err := res.ToString()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	if res.IsErrorState() {
+		var response struct {
+			Source string `json:"src"`
+			Type   string `json:"type"`
+		}
+		if err := res.UnmarshalJson(&response); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal error response as json: %w", err)
+		}
+		return nil, fmt.Errorf("received HTTP %d response: error: %s", res.StatusCode, response.Type)
+	}
+
+	decodedBody, err := base64.StdEncoding.DecodeString(body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode body as base64: %w", err)
+	}
+
+	plaintextBody, err := s.crypto.Decrypt(s.DeviceEncryptionToken, decodedBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt body: %w", err)
+	}
+
+	res.Response.Body = io.NopCloser(bytes.NewReader(plaintextBody))
+	res = &req.Response{
+		Response: res.Response,
+		Err:      nil,
+		Request:  r,
+	}
+	res.Header.Set("content-type", "application/json; charset=utf-8")
+
+	var verifiable struct {
+		RequestID int64 `json:"rid"`
+	}
+	if err := res.UnmarshalJson(&verifiable); err == nil {
+		if err := s.VerifyRequestID(verifiable.RequestID); err != nil {
+			return nil, err
+		}
+	}
+
+	return res, nil
 }

@@ -26,28 +26,49 @@ func (c crypto) DeviceSecret() []byte {
 	return c.makeSecret("device")
 }
 
-func (c crypto) Sign(key []byte, message string) string {
+func (c crypto) Sign(key []byte, message []byte) string {
 	h := hmac.New(sha256.New, key)
-	h.Write([]byte(message))
+	h.Write(message)
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
-func (c crypto) Decrypt(key []byte, encrypted []byte) ([]byte, error) {
+func (c crypto) Encrypt(key []byte, message []byte) ([]byte, error) {
 	if len(key) != 32 {
-		return nil, fmt.Errorf("key must be at least 32 bytes")
+		return nil, fmt.Errorf("key must be 32 bytes long")
 	}
-	aesKey := key[16:] // first half
-	iv := key[:16]     // second half
+
+	iv := key[:16]     // first half
+	aesKey := key[16:] // second half
 
 	block, err := aes.NewCipher(aesKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create aes cipher: %w", err)
 	}
 
-	cbc := cipher.NewCBCDecrypter(block, iv)
+	enc := cipher.NewCBCEncrypter(block, iv)
+
+	padded := c.pad(message, enc.BlockSize())
+	buf := make([]byte, len(padded))
+	enc.CryptBlocks(buf, padded)
+	return buf, nil
+}
+
+func (c crypto) Decrypt(key []byte, encrypted []byte) ([]byte, error) {
+	if len(key) != 32 {
+		return nil, fmt.Errorf("key must be at least 32 bytes")
+	}
+	iv := key[:16]     // first half
+	aesKey := key[16:] // second half
+
+	block, err := aes.NewCipher(aesKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create aes cipher: %w", err)
+	}
+
+	dec := cipher.NewCBCDecrypter(block, iv)
 
 	buf := make([]byte, len(encrypted))
-	cbc.CryptBlocks(buf, encrypted)
+	dec.CryptBlocks(buf, encrypted)
 	buf = c.unpad(buf)
 
 	return buf, nil
