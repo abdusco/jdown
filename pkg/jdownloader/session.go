@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -139,10 +140,14 @@ func (s *session) serverRoundTrip(rt req.RoundTripper, r *req.Request) (*req.Res
 
 func (s *session) deviceRoundTrip(rt req.RoundTripper, r *req.Request, device Device) (*req.Response, error) {
 	action := r.URL.Path
+	var params []any
+	if len(r.Body) > 0 {
+		params = []any{string(r.Body)}
+	}
 	payload := wrappedPayload{
 		APIVersion: 1,
 		URL:        action,
-		Params:     []any{string(r.Body)},
+		Params:     params,
 		RequestID:  s.NextRequestID(),
 	}
 
@@ -176,34 +181,38 @@ func (s *session) deviceRoundTrip(rt req.RoundTripper, r *req.Request, device De
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
+	if !strings.HasPrefix(body, "{") {
+		// not JSON, possibly still encrypted
+
+		decodedBody, err := base64.StdEncoding.DecodeString(body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode body as base64: %w", err)
+		}
+
+		plaintextBody, err := s.crypto.Decrypt(s.DeviceEncryptionToken, decodedBody)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decrypt body: %w", err)
+		}
+		// recreate response as plaintext JSON
+		res.Response.Body = io.NopCloser(bytes.NewReader(plaintextBody))
+		res = &req.Response{
+			Response: res.Response,
+			Err:      nil,
+			Request:  r,
+		}
+		res.Header.Set("content-type", "application/json; charset=utf-8")
+	}
+
 	if res.IsErrorState() {
-		var response struct {
+		var errorResult struct {
 			Source string `json:"src"`
 			Type   string `json:"type"`
 		}
-		if err := res.UnmarshalJson(&response); err != nil {
+		if err := res.UnmarshalJson(&errorResult); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal error response as json: %w", err)
 		}
-		return nil, fmt.Errorf("received HTTP %d response: error: %s", res.StatusCode, response.Type)
+		return nil, fmt.Errorf("received HTTP %d response: error: %s", res.StatusCode, errorResult.Type)
 	}
-
-	decodedBody, err := base64.StdEncoding.DecodeString(body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode body as base64: %w", err)
-	}
-
-	plaintextBody, err := s.crypto.Decrypt(s.DeviceEncryptionToken, decodedBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decrypt body: %w", err)
-	}
-
-	res.Response.Body = io.NopCloser(bytes.NewReader(plaintextBody))
-	res = &req.Response{
-		Response: res.Response,
-		Err:      nil,
-		Request:  r,
-	}
-	res.Header.Set("content-type", "application/json; charset=utf-8")
 
 	var verifiable struct {
 		RequestID int64 `json:"rid"`

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/imroc/req/v3"
+	"github.com/samber/lo"
 	"golang.org/x/exp/slog"
 )
 
@@ -217,6 +218,7 @@ func (c *DeviceClient) AddLink(ctx context.Context, packageName string, urls ...
 	params := addLinkParams{
 		Links:       urls,
 		PackageName: &packageName,
+		AutoStart:   lo.ToPtr(false),
 	}
 	res, err := c.http.R().
 		SetContext(ctx).
@@ -241,4 +243,16 @@ func (c *DeviceClient) AddLink(ctx context.Context, packageName string, urls ...
 	}
 
 	return nil
+}
+
+func (c *DeviceClient) StartDownload() error {
+	_, err := c.http.R().
+		Post("/downloadcontroller/start")
+	return err
+}
+
+func (c *DeviceClient) StopDownload() error {
+	_, err := c.http.R().
+		Post("/downloadcontroller/stop")
+	return err
 }
